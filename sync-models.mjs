@@ -177,7 +177,15 @@ export function formatReport(r) {
   return lines.join("\n")
 }
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href
+let argvPath = null
+if (process.argv[1]) {
+  try {
+    argvPath = fs.realpathSync(process.argv[1])
+  } catch {
+    argvPath = null
+  }
+}
+const isMain = argvPath && import.meta.url === pathToFileURL(argvPath).href
 if (isMain) {
   try {
     const args = parseArgs(process.argv.slice(2))

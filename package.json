@@ -7,7 +7,10 @@
   "bin": {
     "opencode-models": "./sync-models.mjs"
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {
-    "@opencode/plugin": "latest"
+    "@opencode/plugin": "2.2.6"
   }
 }
