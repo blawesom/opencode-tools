@@ -106,6 +106,9 @@ its own proposal). `qwen` stays the everyday working model.
 
 The toggle is stored per session, so switching agents (plan ↔ build) in the
 same session keeps it. Default: **off** — no council cost until you opt in.
+Both commands confirm with an explicit `Council is now ON/OFF` note. Every
+council note ends with a `Council: ON|OFF for this session` status line, so
+the state is always visible.
 
 ### One-shot — `/council <request>`
 
@@ -122,8 +125,13 @@ In any session, regardless of the toggle:
 3. The session receives the original request plus the council decision
    block, and plans *from* that decision.
 
+Feedback: a "convening" note (members, chair, quorum, session status) shows
+when the command runs, and when the answer completes a recap note shows what
+the council did — how many members responded, the full converged decision,
+and the current `ON|OFF` status with a hint for `/council on`.
+
 If the quorum is not reached, the plain request is submitted unchanged —
-the flow is never blocked.
+the flow is never blocked (and the recap says so).
 
 ### Idle review — double-checked work (automatic, when enabled)
 

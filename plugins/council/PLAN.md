@@ -108,13 +108,17 @@ All of the following were confirmed against the installed
 
 - State lives in a per-session `Map<sessionID, SessionState>`; `enabled`
   defaults to `false`.
-- `/council on` sets `enabled = true` and posts a `resume: false` confirmation.
+- `/council on` sets `enabled = true` and posts a `resume: false`
+  confirmation: "Council is now **ON** for this session — …".
 - `/council off` sets `enabled = false`, resets `rounds` and
-  `lastReviewedCount`, and posts a confirmation.
+  `lastReviewedCount`, and posts "Council is now **OFF** …".
 - `/council` with no args reports the current state and usage.
 - The state is keyed by session, not agent, so switching agents (plan ↔
   build) in the same session keeps the toggle.
 - The literal texts `on`/`off` (case-insensitive) are reserved for the toggle.
+- Every displayed council note ends with a status line
+  (`statusLine(st)` → `Council: ON|OFF for this session`), so the state is
+  always visible no matter which `/council` form was used.
 
 ## One-shot — `/council <request>`
 
@@ -122,6 +126,8 @@ Works in any session regardless of the toggle:
 
 1. User types `/council <request>`.
 2. Command `execute`:
+   - **Convening note (feedback at start):** a `resume: false` note with the
+     members, chair, quorum, and the session status line.
    - **Round 1 — proposals (parallel):** each member receives the user's
      request framed as "you are one member of a council; propose the best
      approach, concise". `Promise.allSettled` with a per-member timeout
@@ -136,6 +142,14 @@ Works in any session regardless of the toggle:
 3. Quorum rule: at least 2 member responses are needed to run synthesis
    (plus the chair). Below quorum, log a warning and submit the plain
    request unchanged so the flow is never blocked.
+4. **Recap note (feedback at end of the answer):** the decision + member
+   stats are stored in `SessionState.pendingReport`; the `experimental.idle`
+   hook posts it once when the answer completes (before the enabled check,
+   so it works with the toggle off) as a `resume: false` "council report"
+   note: "Council did: N/M members proposed… chair … converged the decision
+   below", the **full converged decision**, the status line, and a
+   `/council on` hint. Failure paths (below quorum, exception) get an
+   honest recap too.
 
 ## Idle review — double-checked work (when the session toggle is on)
 
@@ -157,18 +171,22 @@ Works in any session regardless of the toggle:
 3. **Review round:** each member reviews in parallel and must answer with
    a strict format: `APPROVE` or `REJECT` on the first line, followed by
    numbered issues (if rejecting). Parse defensively.
-4. **All approve** → synthetic note "Council approved ✅" with
+4. **All approve** → synthetic note "Council approved ✅" + status line, with
    `resume: false`. Reset the round counter.
 5. **Any reject** → the chair merges all rejected issues into a single
    prioritized, de-duplicated fix list → injected as a synthetic message
    (`resume: true`, runs in the same execution) → the agent fixes → goes
    idle again → the idle hook fires the next review round.
 6. **Round cap exceeded** → final synthetic note (`resume: false`) listing
-   unresolved issues; the counter resets on the next user prompt.
+   unresolved issues + status line; the counter resets on the next user prompt.
+
+All review notes end with the session status line.
 
 ## Loop safety
 
-- Per-session in-memory state: `Map<sessionID, { enabled, rounds, lastReviewedCount, lastUserId, reviewing }>`
+- Per-session in-memory state: `Map<sessionID, { enabled, rounds, lastReviewedCount, lastUserId, reviewing, pendingReport }>`
+- `pendingReport` (one-shot recap) is posted by the idle hook before any
+  other guard, exactly once, with `resume: false`
 - Round counters reset whenever a new user message arrives (detected in the
   idle hook via the last user message id)
 - Notes injected with `resume: false` never wake the agent, so they cannot
@@ -205,7 +223,10 @@ results feel weak.
 ## Testing checklist
 
 - [ ] Plugin loads with valid options; disabled with warning when `members` is missing
-- [ ] `/council on` enables and confirms with a `resume: false` note; `/council off` disables and resets counters; `/council` with no args reports state
+- [ ] `/council on`/`off` confirm with explicit "Council is now ON/OFF" notes; every note carries the `Council: ON|OFF for this session` status line
+- [ ] `/council` with no args reports state + usage
+- [ ] `/council <request>` posts a convening note immediately and a recap note (member stats + full decision + status + hint) when the answer goes idle — with the toggle off too
+- [ ] Below-quorum / failure one-shots submit the plain request and the recap says so
 - [ ] The toggle survives switching agents in the same session (plan ↔ build)
 - [ ] With the toggle off, idle work triggers no review
 - [ ] `/council <request>` submits an enriched prompt containing the converged decision (works with the toggle off too)

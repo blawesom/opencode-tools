@@ -8,6 +8,9 @@ import { Plugin } from "@opencode/plugin"
 // - One-shot: `/council <request>` (any session, regardless of the toggle):
 //   members propose approaches in parallel, the chair synthesizes one
 //   converged decision, and the enriched request is submitted to the session.
+//   A "convening" note is shown immediately, and when the answer completes a
+//   recap note shows what the council did (members, chair, full decision).
+// Every displayed note ends with the session's on/off status line.
 // - Idle review (when enabled): when the session finishes work and goes
 //   idle, members review the working-tree diff — or, when there is no diff
 //   (e.g. a plan session), the recent conversation. Unanimous approval
@@ -47,7 +50,11 @@ interface SessionState {
   lastReviewedCount: number
   lastUserId?: string
   reviewing: boolean
+  pendingReport?: string
 }
+
+// Shown on every council note so the session's on/off state is always visible.
+const statusLine = (st: SessionState) => `Council: ${st.enabled ? "ON" : "OFF"} for this session`
 
 type ContextMessage = { type: string; id?: string; text?: string }
 
@@ -242,16 +249,16 @@ async function runPlanCouncil(
   generate: GenerateTextFn,
   cfg: CouncilConfig,
   request: string,
-): Promise<string | null> {
+): Promise<{ responded: number; decision: string | null }> {
   const proposals = await runMembers(generate, cfg.members, () => PROPOSE_PROMPT(request), cfg)
   if (proposals.length < cfg.quorum) {
     warn(`quorum not reached (${proposals.length}/${cfg.members.length} responded)`)
-    return null
+    return { responded: proposals.length, decision: null }
   }
   const blocks = proposals.map((p, i) => `### Member ${i + 1} (${label(p.ref)})\n\n${p.text}`).join("\n\n")
   const res = await withTimeout(generate({ prompt: SYNTHESIZE_PROMPT(request, blocks), model: cfg.chair }), cfg.memberTimeoutMs)
   const decision = (res?.text ?? "").trim()
-  return decision || null
+  return { responded: proposals.length, decision: decision || null }
 }
 
 function parseVerdict(text: string): { approved: boolean; issues: string[] } {
@@ -363,7 +370,7 @@ export default Plugin.define({
             await ctx.session
               .synthetic({
                 sessionID,
-                text: `Council is ${st.enabled ? "ON" : "OFF"} for this session.\n\nUsage:\n- /council on — enable council idle review for this session (any agent)\n- /council off — disable it\n- /council <request> — one-shot: members propose, the chair converges one decision, the session proceeds from it`,
+                text: `${statusLine(st)}.\n\nUsage:\n- /council on — enable council idle review for this session (any agent)\n- /council off — disable it\n- /council <request> — one-shot: members propose, the chair converges one decision, the session proceeds from it`,
                 description: "council status",
                 resume: false,
               })
@@ -383,8 +390,8 @@ export default Plugin.define({
               .synthetic({
                 sessionID,
                 text: st.enabled
-                  ? `Council enabled for this session (any agent). When work goes idle, ${cfg.members.map(label).join(", ")} will review it.`
-                  : "Council disabled for this session.",
+                  ? `Council is now **ON** for this session — when work goes idle, ${cfg.members.map(label).join(", ")} will review it.\n\n${statusLine(st)}`
+                  : `Council is now **OFF** for this session — no automatic review; the one-shot /council <request> still works.\n\n${statusLine(st)}`,
                 description: `council ${st.enabled ? "on" : "off"}`,
                 resume: false,
               })
@@ -395,12 +402,26 @@ export default Plugin.define({
           const request = raw
           try {
             log(`plan council convened: ${cfg.members.map(label).join(", ")} (chair ${label(cfg.chair)})`)
-            const decision = await runPlanCouncil(generate, cfg, request)
-            if (!decision) {
-              warn("no converged decision; submitting the request unchanged")
+            await ctx.session
+              .synthetic({
+                sessionID,
+                text: `Council convening — members ${cfg.members.map(label).join(", ")} (chair ${label(cfg.chair)}, quorum ${cfg.quorum}).\n\n${statusLine(st)}`,
+                description: "council convening",
+                resume: false,
+              })
+              .catch(() => {})
+            const result = await runPlanCouncil(generate, cfg, request)
+            if (!result.decision) {
+              warn(`no converged decision (${result.responded}/${cfg.members.length} responded, quorum ${cfg.quorum}); submitting the request unchanged`)
+              st.pendingReport = [
+                `Council did: ${result.responded}/${cfg.members.length} members responded — below quorum ${cfg.quorum}, so the request was submitted unchanged.`,
+                "",
+                statusLine(st),
+              ].join("\n")
               await ctx.session.prompt({ sessionID, text: request })
               return
             }
+            const decision = result.decision
             const enriched = [
               request,
               "",
@@ -412,9 +433,20 @@ export default Plugin.define({
               "---",
               `*Converged by the model council (${cfg.members.map(label).join(", ")}; chair: ${label(cfg.chair)}). Treat it as the agreed direction for this request.*`,
             ].join("\n")
+            st.pendingReport = [
+              `Council did: ${result.responded}/${cfg.members.length} members proposed in parallel (quorum ${cfg.quorum}); chair ${label(cfg.chair)} converged the decision below. It was submitted as the "## Council decision" block of the request.`,
+              "",
+              "## Council decision",
+              "",
+              decision,
+              "",
+              statusLine(st),
+              "Tip: /council on to have this work auto-reviewed when the session goes idle.",
+            ].join("\n")
             await ctx.session.prompt({ sessionID, text: enriched })
           } catch (err) {
             warn(`plan council failed: ${message(err)}; submitting the request unchanged`)
+            st.pendingReport = `Council did: failed (${message(err)}) — the request was submitted unchanged.\n\n${statusLine(st)}`
             await ctx.session.prompt({ sessionID, text: request }).catch(() => {})
           }
         },
@@ -426,9 +458,23 @@ export default Plugin.define({
 
     const idleReg = await ctx.session.hook("experimental.idle", async (event) => {
       try {
+        const st = getState(event.sessionID)
+        // One-shot recap: post what the council did at the end of the answer,
+        // regardless of the toggle (posted once).
+        if (st.pendingReport) {
+          const report = st.pendingReport
+          st.pendingReport = undefined
+          await ctx.session
+            .synthetic({
+              sessionID: event.sessionID,
+              text: report,
+              description: "council report",
+              resume: false,
+            })
+            .catch(() => {})
+        }
         if (!cfg.build.enabled) return
         if (event.background.length > 0) return // work still running; wait for the next idle
-        const st = getState(event.sessionID)
         if (!st.enabled) return // per-session toggle is off
         if (st.reviewing) return
 
@@ -478,7 +524,7 @@ export default Plugin.define({
           if (rejects.length === 0) {
             await ctx.session.synthetic({
               sessionID: event.sessionID,
-              text: `Council review — approved: ${parsed.length} of ${parsed.length} reviewers found no significant issues. ✅`,
+              text: `Council review — approved: ${parsed.length} of ${parsed.length} reviewers found no significant issues. ✅\n\n${statusLine(st)}`,
               description: "council approval",
               resume: false,
             })
@@ -502,7 +548,7 @@ export default Plugin.define({
           if (st.rounds >= cfg.build.maxRounds) {
             await ctx.session.synthetic({
               sessionID: event.sessionID,
-              text: `Council review stopped after ${cfg.build.maxRounds} round(s) — reviewers still report unresolved issues:\n\n${fixList}\n\nThe implementation was left as-is; review the items above manually.`,
+              text: `Council review stopped after ${cfg.build.maxRounds} round(s) — reviewers still report unresolved issues:\n\n${fixList}\n\nThe implementation was left as-is; review the items above manually.\n\n${statusLine(st)}`,
               description: "council unresolved",
               resume: false,
             })
@@ -512,7 +558,7 @@ export default Plugin.define({
 
           await ctx.session.synthetic({
             sessionID: event.sessionID,
-            text: `Council review — round ${st.rounds} of ${cfg.build.maxRounds}: ${rejects.length} of ${parsed.length} reviewers rejected the implementation. Fix the following, most critical first:\n\n${fixList}`,
+            text: `Council review — round ${st.rounds} of ${cfg.build.maxRounds}: ${rejects.length} of ${parsed.length} reviewers rejected the implementation. Fix the following, most critical first:\n\n${fixList}\n\n${statusLine(st)}`,
             description: "council fix list",
             resume: true,
           })
