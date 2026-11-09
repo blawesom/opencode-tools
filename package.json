@@ -1,0 +1,13 @@
+{
+  "name": "opencode-tools",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Tooling for opencode: auto-sync models from an OpenAI-compatible /models endpoint into opencode.json",
+  "bin": {
+    "opencode-models": "./sync-models.mjs"
+  },
+  "dependencies": {
+    "@opencode/plugin": "latest"
+  }
+}

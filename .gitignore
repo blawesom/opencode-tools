@@ -1,0 +1,13 @@
+# dependencies
+node_modules/
+
+# never commit configs that may contain API keys
+opencode.json
+*.bak
+.env
+.env.*
+
+# os / editor noise
+.DS_Store
+*.log
+*.tmp
