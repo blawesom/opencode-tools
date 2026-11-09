@@ -1,12 +1,16 @@
 import { Plugin } from "@opencode/plugin"
 
-// Council: multiple models discuss and converge.
+// Council: multiple models discuss and converge. On/off per session, cross-agent.
 //
-// - `/council <request>` (any session): council members propose approaches in
-//   parallel, the chair synthesizes one converged decision, and the enriched
-//   request is submitted to the session. Intended for plan-mode sessions.
-// - Build double-check: when a build-agent session finishes work and goes
-//   idle, council members review the working-tree diff. Unanimous approval
+// - `/council on` / `/council off`: enable/disable council for the session,
+//   whatever agent it runs (plan, build, custom). State follows the session,
+//   so switching agents keeps the setting. Default: off.
+// - One-shot: `/council <request>` (any session, regardless of the toggle):
+//   members propose approaches in parallel, the chair synthesizes one
+//   converged decision, and the enriched request is submitted to the session.
+// - Idle review (when enabled): when the session finishes work and goes
+//   idle, members review the working-tree diff — or, when there is no diff
+//   (e.g. a plan session), the recent conversation. Unanimous approval
 //   passes; any reject injects a prioritized fix list that runs in the same
 //   execution, capped at `build.maxRounds` review rounds per work burst.
 //
@@ -30,7 +34,7 @@ type GenerateTextFn = (input: { prompt: string; model: ModelRef }) => Promise<{ 
 interface CouncilConfig {
   members: ModelRef[]
   chair: ModelRef
-  build: { enabled: boolean; agents: string[]; maxRounds: number }
+  build: { enabled: boolean; maxRounds: number }
   debug: boolean
   memberTimeoutMs: number
   maxDiffBytes: number
@@ -38,6 +42,7 @@ interface CouncilConfig {
 }
 
 interface SessionState {
+  enabled: boolean
   rounds: number
   lastReviewedCount: number
   lastUserId?: string
@@ -125,7 +130,6 @@ function resolveConfig(raw: unknown): CouncilConfig | null {
   const b = (o.build ?? {}) as Record<string, unknown>
   const build = {
     enabled: b.enabled === undefined ? true : Boolean(b.enabled),
-    agents: toStringArray(b.agents).length > 0 ? toStringArray(b.agents) : ["build"],
     maxRounds: clampInt(b.maxRounds, 2, 1, 10),
   }
 
@@ -180,6 +184,20 @@ Decide:
 - Otherwise output REJECT on the first line, followed by a numbered list of concrete, actionable issues (bugs, unhandled cases, security problems, breakage of surrounding code). Do not report style preferences.
 
 Judge only what is in the diff. If the request is unclear, review the diff on its own merits.`
+
+const REVIEW_MESSAGES_PROMPT = (request: string, transcript: string) => `You are one of several independent reviewers checking work that produced no file diff (e.g. a plan).
+
+Original request:
+${request}
+
+Recent conversation (truncated):
+${transcript}
+
+Decide:
+- Output APPROVE on the first line if the work fulfills the request with no significant defects.
+- Otherwise output REJECT on the first line, followed by a numbered list of concrete, actionable issues (flaws, unhandled cases, contradictions with the request, missing pieces). Do not report style preferences.
+
+Judge only what is in the transcript. If the request is unclear, review the work on its own merits.`
 
 const MERGE_ISSUES_PROMPT = (issues: string) => `You are the chair of a review council. Reviewers rejected an implementation with the issues below.
 
@@ -292,6 +310,19 @@ function findLastUser(messages: readonly ContextMessage[]): { id: string; text: 
   return null
 }
 
+function summarizeRecentMessages(messages: readonly ContextMessage[], maxBytes: number): string {
+  const parts: string[] = []
+  for (const m of messages) {
+    if (m.type !== "user" && m.type !== "assistant") continue
+    const text = typeof m.text === "string" ? m.text.trim() : ""
+    if (!text) continue
+    parts.push(`--- ${m.type} ---\n${text}`)
+  }
+  let out = parts.join("\n\n")
+  if (out.length > maxBytes) out = `${out.slice(0, maxBytes)}\n…(transcript truncated)`
+  return out
+}
+
 // ---------------------------------------------------------------------------
 // Plugin
 // ---------------------------------------------------------------------------
@@ -310,7 +341,7 @@ export default Plugin.define({
     const getState = (sessionID: string): SessionState => {
       let st = states.get(sessionID)
       if (!st) {
-        st = { rounds: 0, lastReviewedCount: 0, reviewing: false }
+        st = { enabled: false, rounds: 0, lastReviewedCount: 0, reviewing: false }
         states.set(sessionID, st)
       }
       return st
@@ -318,25 +349,50 @@ export default Plugin.define({
 
     const disposers: Array<() => Promise<void>> = []
 
-    // --- Plan side: /council command -------------------------------------
+    // --- /council command: on/off toggle + one-shot proposals -------------
 
     const commandReg = await ctx.command.transform((editor) => {
       editor.add({
         name: "council",
         description: "Model council: members propose, the chair converges one decision, the session proceeds from it",
         execute: async ({ sessionID, prompt }) => {
-          const request = String(prompt?.text ?? "").trim()
-          if (!request) {
+          const raw = String(prompt?.text ?? "").trim()
+          const st = getState(sessionID)
+
+          if (!raw) {
             await ctx.session
               .synthetic({
                 sessionID,
-                text: "Usage: /council <request> — the council converges a decision for the request, then the session proceeds from that decision.",
-                description: "council usage",
+                text: `Council is ${st.enabled ? "ON" : "OFF"} for this session.\n\nUsage:\n- /council on — enable council idle review for this session (any agent)\n- /council off — disable it\n- /council <request> — one-shot: members propose, the chair converges one decision, the session proceeds from it`,
+                description: "council status",
                 resume: false,
               })
               .catch(() => {})
             return
           }
+
+          const kw = raw.toLowerCase()
+          if (kw === "on" || kw === "off") {
+            st.enabled = kw === "on"
+            if (!st.enabled) {
+              st.rounds = 0
+              st.lastReviewedCount = 0
+            }
+            log(`session ${sessionID}: council ${st.enabled ? "enabled" : "disabled"}`)
+            await ctx.session
+              .synthetic({
+                sessionID,
+                text: st.enabled
+                  ? `Council enabled for this session (any agent). When work goes idle, ${cfg.members.map(label).join(", ")} will review it.`
+                  : "Council disabled for this session.",
+                description: `council ${st.enabled ? "on" : "off"}`,
+                resume: false,
+              })
+              .catch(() => {})
+            return
+          }
+
+          const request = raw
           try {
             log(`plan council convened: ${cfg.members.map(label).join(", ")} (chair ${label(cfg.chair)})`)
             const decision = await runPlanCouncil(generate, cfg, request)
@@ -366,17 +422,15 @@ export default Plugin.define({
     })
     disposers.push(() => commandReg.dispose())
 
-    // --- Build side: review on idle ---------------------------------------
+    // --- Idle review (per-session /council on, any agent) -------------------
 
     const idleReg = await ctx.session.hook("experimental.idle", async (event) => {
       try {
         if (!cfg.build.enabled) return
         if (event.background.length > 0) return // work still running; wait for the next idle
         const st = getState(event.sessionID)
+        if (!st.enabled) return // per-session toggle is off
         if (st.reviewing) return
-
-        const info = await ctx.session.get({ sessionID: event.sessionID })
-        if (!info?.agent || !cfg.build.agents.includes(info.agent)) return
 
         const messages = (await ctx.session.context({ sessionID: event.sessionID })) as ContextMessage[]
 
@@ -391,22 +445,25 @@ export default Plugin.define({
         if (messages.length <= st.lastReviewedCount) return
         st.lastReviewedCount = messages.length
 
-        // Review surface is the working-tree diff: no repo or no changes →
-        // nothing to double-check. (Committed changes are not reviewed.)
+        // Review surface: the working-tree diff when there is one (committed
+        // changes are not reviewed); otherwise the recent conversation, e.g.
+        // a plan session with no file changes.
         const diff = await gatherWorkingDiff(ctx.vcs.diff, ctx.location.directory, cfg.maxDiffBytes)
-        if (!diff) return
         if (st.rounds >= cfg.build.maxRounds) return // safety; the cap note below normally handles this
 
         st.reviewing = true
         try {
           st.rounds += 1
           const request = lastUser?.text ?? "(no user request found)"
-          log(`build review round ${st.rounds}/${cfg.build.maxRounds} for session ${event.sessionID}`)
+          log(`idle review round ${st.rounds}/${cfg.build.maxRounds} for session ${event.sessionID} (${diff ? "diff" : "transcript"})`)
 
+          const makePrompt = diff
+            ? () => REVIEW_PROMPT(request, diff)
+            : () => REVIEW_MESSAGES_PROMPT(request, summarizeRecentMessages(messages, cfg.maxDiffBytes))
           const verdicts: Array<{ ref: ModelRef; text: string }> = await runMembers(
             generate,
             cfg.members,
-            () => REVIEW_PROMPT(request, diff),
+            makePrompt,
             cfg,
           )
           if (verdicts.length < cfg.quorum) {
@@ -463,12 +520,12 @@ export default Plugin.define({
           st.reviewing = false
         }
       } catch (err) {
-        warn(`build review failed: ${message(err)}`)
+        warn(`idle review failed: ${message(err)}`)
       }
     })
     disposers.push(() => idleReg.dispose())
 
-    log(`ready: members ${cfg.members.map(label).join(", ")}; chair ${label(cfg.chair)}; build review ${cfg.build.enabled ? `on for [${cfg.build.agents.join(", ")}], max ${cfg.build.maxRounds} round(s)` : "disabled"}`)
+    log(`ready: members ${cfg.members.map(label).join(", ")}; chair ${label(cfg.chair)}; idle review ${cfg.build.enabled ? `available via per-session /council on, max ${cfg.build.maxRounds} round(s)` : "disabled"}`)
 
     return () => {
       for (const dispose of disposers) void dispose()

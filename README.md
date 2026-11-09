@@ -4,9 +4,9 @@ The usual tools for my [OpenCode](https://opencode.ai) setup, kept in one repo:
 
 - **[Model sync](#model-sync)** — auto-detect the models served by an
   OpenAI-compatible endpoint and keep them in `opencode.json`.
-- **[Council](#council)** — a council of models that discusses and converges
-  into a single decision for planning, and double-checks build
-  implementations.
+- **[Council](#council)** — a council of models that converges into a single
+  decision (one-shot `/council <request>`), and optionally double-checks each
+  session's work on idle (`/council on|off`, cross-agent).
 
 Each tool lives under `plugins/<name>` and is registered in the `plugins`
 array of `~/.config/opencode/opencode.json`:
@@ -96,9 +96,20 @@ Current setup: members `kimi-k3.1-pro`, `glm-5.3`, `mimo-v2.6-pro`; chair
 `mistral-large-4` (non-voting — it only synthesizes, so it cannot anchor on
 its own proposal). `qwen` stays the everyday working model.
 
-### Plan — `/council` (command-gated)
+### On/off — session toggle (cross-agent)
 
-In any session (intended for plan mode), type:
+```
+/council on     # enable council for this session, whatever agent runs it
+/council off    # disable it
+/council        # show current state + usage
+```
+
+The toggle is stored per session, so switching agents (plan ↔ build) in the
+same session keeps it. Default: **off** — no council cost until you opt in.
+
+### One-shot — `/council <request>`
+
+In any session, regardless of the toggle:
 
 ```
 /council <request>
@@ -114,24 +125,24 @@ In any session (intended for plan mode), type:
 If the quorum is not reached, the plain request is submitted unchanged —
 the flow is never blocked.
 
-### Build — double-checked implementation (automatic)
+### Idle review — double-checked work (automatic, when enabled)
 
-When a session running a build agent finishes work and goes idle:
+When an enabled session finishes work and goes idle:
 
-1. Each member reviews the working-tree diff against the original request
-   and answers `APPROVE` or `REJECT` with numbered issues.
+1. Each member reviews the **working-tree diff** against the original
+   request — or, when there is no diff (e.g. a plan session), the **recent
+   conversation** — and answers `APPROVE` or `REJECT` with numbered issues.
 2. Unanimous approval → a "Council approved ✅" note in the inbox (it does
    not wake the agent).
 3. Any reject → the chair merges the issues into one prioritized fix list,
    injected so the agent immediately fixes them; the next idle triggers the
    next review round.
 4. Rounds are capped (`build.maxRounds`, default 2); afterwards a final
-   note lists the unresolved issues and the implementation is left as-is.
+   note lists the unresolved issues and the work is left as-is.
 
-The review surface is the **working-tree diff** (uncommitted changes,
-including untracked files). Changes that were committed are not reviewed,
-and sessions with no file changes are skipped. A new user message starts a
-fresh work burst and resets the round counter.
+The diff covers uncommitted changes, including untracked files; committed
+changes are not reviewed. A new user message starts a fresh work burst and
+resets the round counter.
 
 ### Options
 
@@ -143,7 +154,7 @@ fresh work burst and resets the round counter.
       "options": {
         "members": ["litellm/kimi-k3.1-pro", "litellm/glm-5.3", "litellm/mimo-v2.6-pro"],
         "chair": "litellm/mistral-large-4",
-        "build": { "enabled": true, "agents": ["build"], "maxRounds": 2 },
+        "build": { "enabled": true, "maxRounds": 2 },
         "debug": false,
         "memberTimeoutMs": 120000,
         "maxDiffBytes": 24576,
@@ -158,12 +169,11 @@ fresh work burst and resets the round counter.
 |---|---|---|
 | `members` | — (required) | `providerID/modelID` refs; the council members |
 | `chair` | first member | the synthesizer model (may be a non-member) |
-| `build.enabled` | `true` | enable the idle build review |
-| `build.agents` | `["build"]` | which agents trigger reviews |
+| `build.enabled` | `true` | global kill switch for the idle review (per-session toggle still defaults to off) |
 | `build.maxRounds` | `2` | max review rounds per work burst |
 | `debug` | `false` | log member call sizes and responses |
 | `memberTimeoutMs` | `120000` | per-member call timeout |
-| `maxDiffBytes` | `24576` | diff cap in reviewer prompts |
+| `maxDiffBytes` | `24576` | cap for diffs and transcripts in reviewer prompts |
 | `quorum` | `2` | min member responses needed to act |
 
 Without `members` the plugin logs a warning and stays disabled. All errors
@@ -171,6 +181,6 @@ are logged with a `[council]` prefix and never block a session.
 
 ### Cost
 
-- `/council`: `members + 1` model calls per invocation (opt-in per use).
-- Build review: `members` calls per round, `+1` chair merge on reject, up to
-  `maxRounds` rounds per work burst.
+- `/council <request>`: `members + 1` model calls per invocation (opt-in per use).
+- Idle review (only in sessions with `/council on`): `members` calls per
+  round, `+1` chair merge on reject, up to `maxRounds` rounds per work burst.
