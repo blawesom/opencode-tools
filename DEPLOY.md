@@ -65,5 +65,5 @@ commands: init, review, goal, sync-models, council
 ```
 
 Models in sync: `qwen`, `kimi-k3.1-pro`, `glm-5.3`, `mistral-large-4`,
-`mimo-v2.6-pro`, `qwen-image` (image). `qwen3.8-27b` is stale (no longer
-served) and kept; remove with `opencode-models --prune`.
+`mimo-v2.6-pro`, `qwen-image` (image). A stale `qwen3.8-27b` entry was
+pruned on 2026-11-09 (`opencode-models --prune`).
